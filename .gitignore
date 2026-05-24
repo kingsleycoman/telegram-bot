@@ -1,0 +1,6 @@
+.env
+google_creds.json
+bot.log
+.DS_Store
+__pycache__/
+*.pyc
