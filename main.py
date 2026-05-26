@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import datetime
+import asyncio
 
 import requests
 import gspread
@@ -404,6 +405,12 @@ def main():
 
     log.info("Бот запущен ✅")
     print("Бот запущен! Открой Telegram и напиши ему /start")
+
+    # Создаём event loop вручную и запускаем бота через него.
+    # Так бот работает на любой версии Python, включая 3.14,
+    # где app.run_polling() сам по себе падает.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app.run_polling()
 
 
