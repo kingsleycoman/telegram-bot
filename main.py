@@ -2,7 +2,7 @@
 """
 Telegram-бот: остатки 1С:УНФ, клиенты, долги.
 Адаптирован под реальные поля 1С УНФ.
-Python 3.11 + python-telegram-bot 20.1
+Управление через кнопки + команды через / остаются рабочими.
 """
 
 import os
@@ -10,14 +10,22 @@ import json
 import logging
 import datetime
 import asyncio
+import difflib
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # ── 1. НАСТРОЙКИ (читаются из файла .env) ──────────────────
 load_dotenv()
@@ -103,18 +111,14 @@ def log_command(update: Update, name: str):
     log.info("Команда %s от @%s (id=%s)", name, user.username, user.id)
 
 
-# ── 6. КОМАНДА /start ───────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_command(update, "/start")
-    text = (
-        "👋 Привет! Я бот склада и клиентов.\n\n"
-        "Вот что я умею:\n"
-        "📦 /stock <название> — остатки товара\n"
-        "👤 /customer <ИНН> — данные клиента\n"
-        "💰 /debt <ИНН> — задолженность клиента\n"
-        "📊 /report — отчёт по просрочкам\n"
-    )
-    await update.message.reply_text(text)
+# Клавиатура с кнопками — показывается в /start и после каждого ответа.
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Остатки товара", callback_data="ask_stock")],
+        [InlineKeyboardButton("👤 Клиент",         callback_data="ask_customer")],
+        [InlineKeyboardButton("💰 Задолженность",  callback_data="ask_debt")],
+        [InlineKeyboardButton("📊 Отчёт по просрочкам", callback_data="run_report")],
+    ])
 
 
 # ── НАЗВАНИЕ НУЖНОГО СКЛАДА ──────────────────────────────
@@ -129,8 +133,6 @@ def words_match(query: str, target: str) -> bool:
     Слова можно писать в любом порядке. Терпит опечатку в одной букве.
     Пример: 'лосось 5-6 sup охл' найдёт 'Лосось атл (семга) ПСГ 5-6 SUP охл'.
     """
-    import difflib
-
     q_words = query.lower().split()
     t_words = target.lower().split()
 
@@ -138,48 +140,58 @@ def words_match(query: str, target: str) -> bool:
         return False
 
     for qw in q_words:
-        # слово подходит, если оно входит в какое-то слово названия...
         ok = any(qw in tw for tw in t_words)
-        # ...или очень похоже на него (опечатка в букве)
         if not ok:
             ok = any(
                 difflib.SequenceMatcher(None, qw, tw).ratio() >= 0.8
                 for tw in t_words
             )
         if not ok:
-            return False  # хотя бы одно слово не найдено — товар не подходит
+            return False
 
     return True
 
 
-# ── 7. КОМАНДА /stock ───────────────────────────────────
-async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_command(update, "/stock")
-    if not context.args:
-        await update.message.reply_text("Напишите так: /stock лосось 5-6 sup")
+# ── 6. КОМАНДА /start ───────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_command(update, "/start")
+    # На всякий случай сбрасываем режим ожидания ввода.
+    context.user_data.pop("waiting_for", None)
+    text = (
+        "👋 Привет! Я бот склада и клиентов.\n\n"
+        "Нажмите кнопку ниже — я попрошу ввести то, что нужно.\n"
+        "Можно и командами: /stock название, /customer ИНН, /debt ИНН."
+    )
+    await update.message.reply_text(text, reply_markup=main_keyboard())
+
+
+# ── ЛОГИКА ПОИСКА ОСТАТКОВ (общая для команды и для кнопки) ──
+async def do_stock(message, query: str):
+    """Ищет товар и отправляет ответ в чат `message`."""
+    query = query.strip()
+    if not query:
+        await message.reply_text("Пустой запрос. Напишите название товара.")
         return
 
-    query = " ".join(context.args).strip()
     data, error = onec_get("/Stocks")
     if error:
-        await update.message.reply_text(error)
+        await message.reply_text(error, reply_markup=main_keyboard())
         return
 
     # 1С отдаёт объект: { "Название склада": [список товаров], ... }
     if not isinstance(data, dict):
-        await update.message.reply_text("⚠️ Неожиданный формат данных от 1С.")
+        await message.reply_text("⚠️ Неожиданный формат данных от 1С.",
+                                 reply_markup=main_keyboard())
         return
 
-    # Берём товары ТОЛЬКО нужного склада
     items = data.get(TARGET_WAREHOUSE)
     if not isinstance(items, list):
-        await update.message.reply_text(
+        await message.reply_text(
             "⚠️ Нужный склад не найден в данных 1С.\n"
-            f"Ожидался: {TARGET_WAREHOUSE}"
-        )
+            f"Ожидался: {TARGET_WAREHOUSE}",
+            reply_markup=main_keyboard())
         return
 
-    # Ищем совпадения: название -> количество (+ единица)
     found = {}
     units = {}
     for item in items:
@@ -191,22 +203,20 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
             units[name] = item.get("ЕдиницаИзмерения", "шт")
 
     if not found:
-        await update.message.reply_text(
+        await message.reply_text(
             f"📦 Ничего не найдено для '{query}'.\n"
-            "Попробуйте написать часть названия, например: лосось 5-6 sup"
-        )
+            "Попробуйте написать часть названия, например: лосось 5-6 sup",
+            reply_markup=main_keyboard())
         return
 
-    # Если совпадение РОВНО одно — короткий ответ
     if len(found) == 1:
         name, qty = next(iter(found.items()))
         unit = units[name]
-        await update.message.reply_text(
-            f"📦 {name}\nОстаток: {qty} {unit}"
-        )
+        await message.reply_text(
+            f"📦 {name}\nОстаток: {qty} {unit}",
+            reply_markup=main_keyboard())
         return
 
-    # Несколько совпадений — список
     lines = [f"📦 Найдено товаров: {len(found)}", ""]
     for name, qty in found.items():
         unit = units[name]
@@ -218,61 +228,75 @@ async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = "\n".join(lines)
     if len(answer) > 4000:
         answer = answer[:4000] + "\n\n… список обрезан, уточните запрос."
-    await update.message.reply_text(answer)
+    await message.reply_text(answer, reply_markup=main_keyboard())
+
+
+# ── 7. КОМАНДА /stock ───────────────────────────────────
+async def cmd_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_command(update, "/stock")
+    if not context.args:
+        # Команда без аргумента — переходим в режим ожидания ввода.
+        context.user_data["waiting_for"] = "stock"
+        await update.message.reply_text("📦 Введите название товара:")
+        return
+    await do_stock(update.message, " ".join(context.args))
+
+
+# ── ЛОГИКА ПО КЛИЕНТУ (общая) ───────────────────────────
+async def do_customer(message, inn: str):
+    inn = inn.strip()
+    if not inn:
+        await message.reply_text("Пустой запрос. Введите ИНН.")
+        return
+
+    data, error = onec_get(f"/Customers/?INN={inn}")
+    if error:
+        await message.reply_text(error, reply_markup=main_keyboard())
+        return
+
+    if not data:
+        await message.reply_text(f"👤 Клиент с ИНН {inn} не найден.",
+                                 reply_markup=main_keyboard())
+        return
+
+    c = data[0] if isinstance(data, list) else data
+
+    text = (
+        "👤 Информация о клиенте:\n\n"
+        f"Компания/ФИО: {c.get('Наименование', '?')}\n"
+        f"ИНН: {c.get('ИНН', '?')}\n"
+        f"Телефон: {c.get('Телефон', '?')}\n"
+        f"Email: {c.get('Email', '?')}\n"
+        f"Адрес: {c.get('Адрес', '?')}"
+    )
+    await message.reply_text(text, reply_markup=main_keyboard())
 
 
 # ── 8. КОМАНДА /customer ────────────────────────────────
 async def cmd_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_command(update, "/customer")
     if not context.args:
-        await update.message.reply_text("Напишите так: /customer 4632570209 41")
+        context.user_data["waiting_for"] = "customer"
+        await update.message.reply_text("👤 Введите ИНН клиента:")
+        return
+    await do_customer(update.message, context.args[0])
+
+
+# ── ЛОГИКА ПО ДОЛГУ (общая) ─────────────────────────────
+async def do_debt(message, inn: str):
+    inn = inn.strip()
+    if not inn:
+        await message.reply_text("Пустой запрос. Введите ИНН.")
         return
 
-    inn = context.args[0].strip()
-    data, error = onec_get(f"/Customers/?INN={inn}")
-    if error:
-        await update.message.reply_text(error)
-        return
-
-    if not data:
-        await update.message.reply_text(f"👤 Клиент с ИНН {inn} не найден.")
-        return
-
-    # data может быть одним объектом или списком
-    c = data[0] if isinstance(data, list) else data
-
-    name = c.get("Наименование", "?")
-    inn_show = c.get("ИНН", "?")
-    phone = c.get("Телефон", "?")
-    email = c.get("Email", "?")
-    address = c.get("Адрес", "?")
-
-    text = (
-        "👤 Информация о клиенте:\n\n"
-        f"Компания/ФИО: {name}\n"
-        f"ИНН: {inn_show}\n"
-        f"Телефон: {phone}\n"
-        f"Email: {email}\n"
-        f"Адрес: {address}"
-    )
-    await update.message.reply_text(text)
-
-
-# ── 9. КОМАНДА /debt ────────────────────────────────────
-async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_command(update, "/debt")
-    if not context.args:
-        await update.message.reply_text("Напишите так: /debt 4632570209 41")
-        return
-
-    inn = context.args[0].strip()
     data, error = onec_get(f"/Debts/?INN={inn}")
     if error:
-        await update.message.reply_text(error)
+        await message.reply_text(error, reply_markup=main_keyboard())
         return
 
     if not data:
-        await update.message.reply_text(f"💰 Долгов по ИНН {inn} не найдено.")
+        await message.reply_text(f"💰 Долгов по ИНН {inn} не найдено.",
+                                 reply_markup=main_keyboard())
         return
 
     d = data[0] if isinstance(data, list) else data
@@ -288,7 +312,6 @@ async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Сумма долга: {amount} руб",
     ]
 
-    # Считаем дни с последнего платежа
     days_passed = None
     if last_pay:
         try:
@@ -301,7 +324,6 @@ async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text.append("Дата последнего платежа: нет данных")
 
-    # Лимит отсрочки из Google Sheets
     credit_days, gs_error = get_credit_days(inn)
     if gs_error:
         text.append(f"Лимит отсрочки: {gs_error}")
@@ -314,15 +336,23 @@ async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 text.append("Статус: ✅ Без просрочки")
 
-    await update.message.reply_text("\n".join(text))
+    await message.reply_text("\n".join(text), reply_markup=main_keyboard())
 
 
-# ── 10. КОМАНДА /report ─────────────────────────────────
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_command(update, "/report")
-    await update.message.reply_text("⏳ Загружаю отчёт... (может занять минуту)")
+# ── 9. КОМАНДА /debt ────────────────────────────────────
+async def cmd_debt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_command(update, "/debt")
+    if not context.args:
+        context.user_data["waiting_for"] = "debt"
+        await update.message.reply_text("💰 Введите ИНН клиента:")
+        return
+    await do_debt(update.message, context.args[0])
 
-    # Берём все ИНН из Google Sheets
+
+# ── ЛОГИКА ОТЧЁТА (общая) ───────────────────────────────
+async def do_report(message):
+    await message.reply_text("⏳ Загружаю отчёт... (может занять минуту)")
+
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
         creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=scopes)
@@ -330,14 +360,17 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sheet = client.open(GOOGLE_SHEET_NAME).sheet1
         rows = sheet.get_all_records()
     except FileNotFoundError:
-        await update.message.reply_text("❌ Файл ключа Google не найден.")
+        await message.reply_text("❌ Файл ключа Google не найден.",
+                                 reply_markup=main_keyboard())
         return
     except Exception as e:  # noqa: BLE001
-        await update.message.reply_text(f"❌ Ошибка Google Sheets: {e}")
+        await message.reply_text(f"❌ Ошибка Google Sheets: {e}",
+                                 reply_markup=main_keyboard())
         return
 
     if not rows:
-        await update.message.reply_text("❌ Google-таблица пуста.")
+        await message.reply_text("❌ Google-таблица пуста.",
+                                 reply_markup=main_keyboard())
         return
 
     overdue_list = []
@@ -346,12 +379,8 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not inn:
             continue
 
-        # Запрашиваем долг конкретного клиента из 1С
         data, error = onec_get(f"/Debts/?INN={inn}")
-        if error:
-            continue
-
-        if not data:
+        if error or not data:
             continue
 
         d = data[0] if isinstance(data, list) else data
@@ -370,7 +399,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         days_passed = (datetime.date.today() - pay_date).days
         credit_days, gs_error = get_credit_days(inn)
-
         if gs_error:
             continue
 
@@ -381,15 +409,70 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     if not overdue_list:
-        await update.message.reply_text("📊 Просрочек нет — все молодцы! ✅")
+        await message.reply_text("📊 Просрочек нет — все молодцы! ✅",
+                                 reply_markup=main_keyboard())
         return
 
-    await update.message.reply_text(
-        "📊 Отчёт по просрочкам:\n\n" + "\n".join(overdue_list)
-    )
+    await message.reply_text(
+        "📊 Отчёт по просрочкам:\n\n" + "\n".join(overdue_list),
+        reply_markup=main_keyboard())
 
 
-# ── 11. ЗАПУСК БОТА ──────────────────────────────────────
+# ── 10. КОМАНДА /report ─────────────────────────────────
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_command(update, "/report")
+    context.user_data.pop("waiting_for", None)
+    await do_report(update.message)
+
+
+# ── 11. НАЖАТИЕ НА КНОПКУ ───────────────────────────────
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # убираем "часики" на кнопке
+    action = query.data
+
+    if action == "ask_stock":
+        context.user_data["waiting_for"] = "stock"
+        await query.message.reply_text("📦 Введите название товара:")
+
+    elif action == "ask_customer":
+        context.user_data["waiting_for"] = "customer"
+        await query.message.reply_text("👤 Введите ИНН клиента:")
+
+    elif action == "ask_debt":
+        context.user_data["waiting_for"] = "debt"
+        await query.message.reply_text("💰 Введите ИНН клиента:")
+
+    elif action == "run_report":
+        context.user_data.pop("waiting_for", None)
+        await do_report(query.message)
+
+
+# ── 12. ОБРАБОТКА ОБЫЧНОГО ТЕКСТА ───────────────────────
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает, когда пользователь прислал текст без команды."""
+    waiting = context.user_data.get("waiting_for")
+    user_text = (update.message.text or "").strip()
+
+    if waiting == "stock":
+        context.user_data.pop("waiting_for", None)
+        await do_stock(update.message, user_text)
+
+    elif waiting == "customer":
+        context.user_data.pop("waiting_for", None)
+        await do_customer(update.message, user_text)
+
+    elif waiting == "debt":
+        context.user_data.pop("waiting_for", None)
+        await do_debt(update.message, user_text)
+
+    else:
+        # Бот ничего не ждал — показываем кнопки.
+        await update.message.reply_text(
+            "Выберите, что нужно:", reply_markup=main_keyboard())
+
+
+# ── 13. ЗАПУСК БОТА ──────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         log.error("Нет TELEGRAM_TOKEN. Проверьте файл .env")
@@ -397,11 +480,19 @@ def main():
         return
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Команды через /
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stock", cmd_stock))
     app.add_handler(CommandHandler("customer", cmd_customer))
     app.add_handler(CommandHandler("debt", cmd_debt))
     app.add_handler(CommandHandler("report", cmd_report))
+
+    # Нажатия на кнопки
+    app.add_handler(CallbackQueryHandler(on_button))
+
+    # Любой обычный текст (не команда)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("Бот запущен ✅")
     print("Бот запущен! Открой Telegram и напиши ему /start")
