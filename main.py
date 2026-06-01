@@ -11,6 +11,8 @@ import logging
 import datetime
 import asyncio
 import difflib
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 import gspread
@@ -472,12 +474,40 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите, что нужно:", reply_markup=main_keyboard())
 
 
+# ── ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ─────────────────────
+# Render (тип Web Service) требует, чтобы сервис открыл сетевой порт,
+# иначе считает деплой неудачным и выключает бот. Бот сам порт не
+# открывает, поэтому мы поднимаем крошечный веб-сервер в отдельном
+# потоке. Он просто отвечает "OK" — этого хватает, чтобы Render был
+# доволен и не выключал сервис.
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass  # не засоряем логи
+
+
+def start_health_server():
+    # Render передаёт нужный порт в переменной PORT. Если её нет — 10000.
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server.serve_forever()
+
+
 # ── 13. ЗАПУСК БОТА ──────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         log.error("Нет TELEGRAM_TOKEN. Проверьте файл .env")
         print("ОШИБКА: не заполнен файл .env (нет TELEGRAM_TOKEN).")
         return
+
+    # Запускаем фиктивный веб-сервер в фоне (отдельный поток),
+    # чтобы Render видел открытый порт и не выключал бот.
+    threading.Thread(target=start_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
